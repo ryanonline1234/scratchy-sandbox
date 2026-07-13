@@ -394,14 +394,27 @@ const addCustomBackdrop = async msg => {
 
 /* ------------------------------------------------------------ stage eye */
 
-const seeStage = () => new Promise((resolve, reject) => {
+const seeStage = async () => {
     const renderer = refs.vm.renderer;
-    if (!renderer || typeof renderer.requestSnapshot !== 'function') {
-        reject(new Error('stage snapshots not supported here'));
-        return;
+    if (!renderer) throw new Error('stage snapshots not supported here');
+    let uri = null;
+    if (typeof renderer.requestSnapshot === 'function') {
+        // Waits for the next draw — which never comes when Chrome throttles
+        // rAF for this (cross-origin iframe) context, yielding "data:,".
+        uri = await Promise.race([
+            new Promise(resolve => renderer.requestSnapshot(resolve)),
+            sleep(3000).then(() => null)
+        ]);
     }
-    renderer.requestSnapshot(dataURI => resolve({image: dataURI}));
-});
+    if (!uri || uri.length < 1000) {
+        // Throttled: force a draw and read the buffer in the same task
+        // (valid even with preserveDrawingBuffer: false).
+        renderer.draw();
+        uri = renderer.canvas.toDataURL('image/png');
+    }
+    if (!uri || uri.length < 1000) throw new Error('stage camera unavailable right now');
+    return {image: uri};
+};
 
 /* ------------------------------------------------------------ dispatch */
 
