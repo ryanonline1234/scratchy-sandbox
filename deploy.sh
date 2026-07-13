@@ -15,6 +15,16 @@ rm -f -- *.js.map chunks/*.js.map
 rm -f -- blocksonly.js blocksonly.js.LICENSE.txt blocks-only.html
 rm -f -- compatibilitytesting.js compatibilitytesting.js.LICENSE.txt compatibility-testing.html
 rm -f -- player.js player.js.LICENSE.txt player.html
+# Maps are gone — drop the dangling sourceMappingURL pointers too (devtools
+# 404 noise otherwise).
+for f in *.js; do
+  sed -i '' -e 's|^//# sourceMappingURL=.*$||' "$f"
+done
+# scratch-storage ships prebuilt with a nested webpack runtime that loads
+# chunks/fetch-worker.<hash>.js at runtime — scratch-gui's build never
+# copies it, so the worker 404s (this was the root cause of the original
+# library-asset hang). Ship the real file.
+cp ../node_modules/scratch-storage/dist/web/chunks/fetch-worker.*.js chunks/ 2>/dev/null || true
 
 vercel link --yes --project scratchy-sandbox
 vercel deploy --prod --yes
