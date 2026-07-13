@@ -1,22 +1,27 @@
 /**
  * Scratchy bridge — lets a parent page (the CCIC Scratchy app) drive this
- * sandbox over postMessage: place scripts, read the workspace, switch
- * sprites, run the project. Placement is animated block-by-block with a
- * fake cursor so kids can watch "Scratchy dragging blocks."
+ * sandbox over postMessage: place scripts, read the workspace, add library
+ * or AI-drawn custom sprites, snapshot the stage, run the project.
+ * Placement is animated block-by-block with a fake cursor so kids can
+ * watch "Scratchy dragging blocks."
  *
  * Protocol (parent -> sandbox):
  *   {scratchy: true, id, action: 'hello'}
- *   {scratchy: true, id, action: 'add_script', xml, note?}
+ *   {scratchy: true, id, action: 'add_script', xml}
  *   {scratchy: true, id, action: 'delete_script', blockId}
  *   {scratchy: true, id, action: 'set_field', blockId, field, value}
  *   {scratchy: true, id, action: 'read_workspace'}
  *   {scratchy: true, id, action: 'select_sprite', name}
- *   {scratchy: true, id, action: 'add_sprite', name}
+ *   {scratchy: true, id, action: 'add_sprite', name}            // Scratch library
+ *   {scratchy: true, id, action: 'add_custom_sprite', name, svg, x?, y?, size?}
+ *   {scratchy: true, id, action: 'add_custom_backdrop', svg, name?}
+ *   {scratchy: true, id, action: 'see_stage'}                   // -> {image: dataURI}
  *   {scratchy: true, id, action: 'run_project'} | 'stop_project'
  * Replies (sandbox -> parent): {scratchy: true, id, ok, data?, error?}
  * Plus one unsolicited event on boot: {scratchy: true, event: 'ready'}
  */
 
+import {sanitizeSvg} from 'scratch-svg-renderer';
 import storage from '../lib/storage';
 
 const ALLOWED_PARENTS = [
@@ -88,14 +93,14 @@ const nextFreeY = workspace => {
     return maxBottom;
 };
 
-// Variable fields arrive by name only; make sure the variable exists and
-// stamp its id into the DOM so domToWorkspace links it correctly.
 const VAR_TYPE_BY_FIELD = {
     VARIABLE: '',
     LIST: 'list',
     BROADCAST_OPTION: 'broadcast_msg'
 };
 
+// Variable fields arrive by name only; make sure the variable exists and
+// stamp its id into the DOM so domToWorkspace links it correctly.
 const ensureVariables = (dom, workspace) => {
     const fields = dom.querySelectorAll(
         'field[name="VARIABLE"], field[name="LIST"], field[name="BROADCAST_OPTION"]'
@@ -112,20 +117,16 @@ const ensureVariables = (dom, workspace) => {
 };
 
 const revealOrder = topBlock => {
-    // Pre-order walk: block, its value inputs' shadows ride along with it,
-    // statement substacks and next-chain get their own reveal steps.
+    // Pre-order walk: statement substacks and next-chain get their own
+    // reveal steps; value inputs (shadows, reporters) ride with the parent.
     const order = [];
     const walk = block => {
         if (!block) return;
         order.push(block);
         block.inputList.forEach(input => {
-            if (input.connection && input.connection.targetBlock()) {
-                const child = input.connection.targetBlock();
-                // Statement inputs (substacks) reveal step-by-step; value
-                // inputs (numbers, dropdowns, reporters) ride with parent.
-                if (input.type === 3 /* NEXT_STATEMENT */) {
-                    walk(child);
-                }
+            if (input.type === 3 /* NEXT_STATEMENT */ &&
+                input.connection && input.connection.targetBlock()) {
+                walk(input.connection.targetBlock());
             }
         });
         walk(block.getNextBlock());
@@ -134,17 +135,8 @@ const revealOrder = topBlock => {
     return order;
 };
 
-const setScriptVisible = (topBlock, visible) => {
-    const all = topBlock.getDescendants ? topBlock.getDescendants() : [topBlock];
-    all.forEach(block => {
-        const root = block.getSvgRoot && block.getSvgRoot();
-        if (root) root.style.visibility = visible ? 'visible' : 'hidden';
-    });
-};
-
 const animateReveal = async topBlock => {
     const steps = revealOrder(topBlock);
-    // Hide only the stepped blocks; value shadows inherit parent visibility.
     steps.forEach(block => {
         const root = block.getSvgRoot();
         if (root) root.style.visibility = 'hidden';
@@ -199,78 +191,111 @@ const addScript = async xmlText => {
         }
         await animateReveal(top);
     }
-    return {blockIds: newTops.map(b => b.id)};
+    // Echo what actually landed so the model can verify itself.
+    const target = refs.vm.editingTarget;
+    const placed = target ?
+        newTops.map(top => vmSerializeScript(target.blocks._blocks, top.id, '').join('\n')) :
+        [];
+    return {blockIds: newTops.map(b => b.id), placed};
 };
 
 /* ------------------------------------------------------------ reading */
 
-const blockLine = block => {
-    // Humanized single line: field values inline, value inputs stringified.
-    const parts = [block.type];
-    const fields = {};
-    block.inputList.forEach(input => {
-        input.fieldRow.forEach(field => {
-            if (field.name) fields[field.name] = field.getText();
-        });
-        if (input.type !== 3 && input.connection && input.connection.targetBlock()) {
-            fields[input.name] = `(${input.connection.targetBlock().toString()})`;
+// Serialize scripts from VM block data (works for ALL sprites, not just
+// the one open in the Blockly workspace). Ids match Blockly's.
+const vmBlockLine = (blocks, id) => {
+    const b = blocks[id];
+    if (!b) return '?';
+    const kv = [];
+    Object.keys(b.fields || {}).forEach(name => {
+        kv.push(`${name}=${b.fields[name].value}`);
+    });
+    Object.keys(b.inputs || {}).forEach(name => {
+        if (name.indexOf('SUBSTACK') === 0) return;
+        const inp = b.inputs[name];
+        if (!inp.block) return;
+        const child = blocks[inp.block];
+        if (!child) return;
+        if (inp.block === inp.shadow) {
+            const firstField = Object.keys(child.fields || {})[0];
+            kv.push(`${name}=(${firstField ? child.fields[firstField].value : ''})`);
+        } else {
+            kv.push(`${name}=(${vmBlockLine(blocks, inp.block)})`);
         }
     });
-    const kv = Object.keys(fields).map(k => `${k}=${fields[k]}`);
-    if (kv.length) parts.push(`[${kv.join(', ')}]`);
-    return parts.join(' ');
+    return b.opcode + (kv.length ? ` [${kv.join(', ')}]` : '');
 };
 
-const serializeScript = (block, indent) => {
+const vmSerializeScript = (blocks, topId, indent) => {
     const lines = [];
-    let current = block;
-    while (current) {
-        lines.push(`${indent}${current.isShadow() ? '' : `{${current.id}} `}${blockLine(current)}`);
-        current.inputList.forEach(input => {
-            if (input.type === 3 && input.connection && input.connection.targetBlock()) {
-                lines.push(...serializeScript(input.connection.targetBlock(), `${indent}  `));
+    let cur = topId;
+    while (cur) {
+        const b = blocks[cur];
+        if (!b) break;
+        lines.push(`${indent}{${cur}} ${vmBlockLine(blocks, cur)}`);
+        ['SUBSTACK', 'SUBSTACK2'].forEach(name => {
+            const inp = (b.inputs || {})[name];
+            if (inp && inp.block) {
+                lines.push(...vmSerializeScript(blocks, inp.block, `${indent}  `));
             }
         });
-        current = current.getNextBlock();
+        cur = b.next;
     }
     return lines;
 };
 
 const readWorkspace = () => {
-    const {workspace, vm} = refs;
+    const {vm} = refs;
     const sprites = vm.runtime.targets
         .filter(t => t.isOriginal)
-        .map(t => ({
-            name: t.getName(),
-            isStage: t.isStage,
-            x: Math.round(t.x || 0),
-            y: Math.round(t.y || 0),
-            costumes: t.getCostumes().length,
-            editing: vm.editingTarget && vm.editingTarget.id === t.id
-        }));
-    const scripts = workspace.getTopBlocks(true).map(top => serializeScript(top, '').join('\n'));
+        .map(t => {
+            const blocks = t.blocks._blocks;
+            const scripts = t.blocks._scripts.map(topId =>
+                vmSerializeScript(blocks, topId, '').join('\n'));
+            const variables = {};
+            Object.keys(t.variables || {}).forEach(vid => {
+                const v = t.variables[vid];
+                if (v.type === '') variables[v.name] = v.value;
+            });
+            return {
+                name: t.getName(),
+                isStage: t.isStage,
+                editing: vm.editingTarget && vm.editingTarget.id === t.id,
+                x: Math.round(t.x || 0),
+                y: Math.round(t.y || 0),
+                size: t.size,
+                direction: t.direction,
+                visible: t.visible,
+                currentCostume: t.getCostumes()[t.currentCostume] ?
+                    t.getCostumes()[t.currentCostume].name : null,
+                costumes: t.getCostumes().map(c => c.name),
+                sounds: t.getSounds().map(s => s.name),
+                variables,
+                scripts
+            };
+        });
     return {
-        sprites,
+        stage: {width: 480, height: 360, note: 'x -240..240, y -180..180'},
         editingSprite: vm.editingTarget ? vm.editingTarget.getName() : null,
-        scripts
+        sprites
     };
 };
 
 /* ------------------------------------------------------------ sprites */
 
-const selectSprite = name => {
+const selectSprite = async name => {
     const {vm} = refs;
     const target = vm.runtime.targets.find(
         t => t.isOriginal && t.getName().toLowerCase() === String(name).toLowerCase()
     );
     if (!target) throw new Error(`No sprite named "${name}"`);
     vm.setEditingTarget(target.id);
+    await sleep(300); // let the Blockly workspace swap before the next action
     return {selected: target.getName()};
 };
 
 const addSprite = async name => {
     const {vm} = refs;
-    // Lazy-load the standard sprite library and match by name.
     const {default: spriteLibrary} = await import('../lib/libraries/sprites.json');
     const wanted = String(name).toLowerCase();
     const entry = spriteLibrary.find(s => s.name.toLowerCase() === wanted) ||
@@ -280,6 +305,104 @@ const addSprite = async name => {
     return {added: entry.name};
 };
 
+/* ------------------------------------------- AI-drawn sprites/backdrops */
+
+const svgToAsset = svgText => {
+    const text = String(svgText || '').trim();
+    if (!text.toLowerCase().includes('<svg')) throw new Error('svg must be a complete <svg>…</svg> document');
+    if (text.length > 60000) throw new Error('svg too big — keep it under 60KB');
+    // Scratch's own sanitizer (same one used for kid file uploads).
+    const clean = sanitizeSvg.sanitizeByteStream(new TextEncoder().encode(text));
+    const asset = storage.createAsset(
+        storage.AssetType.ImageVector,
+        storage.DataFormat.SVG,
+        clean,
+        null,
+        true // generate md5
+    );
+    // createAsset does NOT register the asset anywhere storage.load() can
+    // find it — loadCostume would fall through to the CDN and 404. Cache it
+    // like the default project's assets are cached.
+    storage.builtinHelper._store(
+        storage.AssetType.ImageVector,
+        storage.DataFormat.SVG,
+        clean,
+        asset.assetId
+    );
+    // Rotation center = middle of the viewBox (fallback 50,50).
+    let cx = 50;
+    let cy = 50;
+    const vb = (text.match(/viewBox\s*=\s*"([^"]+)"/i) || [])[1];
+    if (vb) {
+        const p = vb.trim().split(/[\s,]+/).map(Number);
+        if (p.length === 4 && p.every(n => !isNaN(n))) {
+            cx = p[0] + (p[2] / 2);
+            cy = p[1] + (p[3] / 2);
+        }
+    }
+    return {asset, cx, cy};
+};
+
+const addCustomSprite = async msg => {
+    const {vm} = refs;
+    const {asset, cx, cy} = svgToAsset(msg.svg);
+    const name = String(msg.name || 'My Sprite').slice(0, 30);
+    const sprite = {
+        name,
+        isStage: false,
+        x: typeof msg.x === 'number' ? msg.x : 0,
+        y: typeof msg.y === 'number' ? msg.y : 0,
+        visible: true,
+        size: typeof msg.size === 'number' ? msg.size : 100,
+        direction: 90,
+        draggable: false,
+        rotationStyle: 'all around',
+        variables: {},
+        lists: {},
+        broadcasts: {},
+        blocks: {},
+        currentCostume: 0,
+        costumes: [{
+            name: 'costume1',
+            assetId: asset.assetId,
+            md5ext: `${asset.assetId}.svg`,
+            dataFormat: 'svg',
+            rotationCenterX: cx,
+            rotationCenterY: cy
+        }],
+        sounds: []
+    };
+    await vm.addSprite(JSON.stringify(sprite));
+    return {added: name};
+};
+
+const addCustomBackdrop = async msg => {
+    const {vm} = refs;
+    const {asset, cx, cy} = svgToAsset(msg.svg);
+    const name = String(msg.name || 'my backdrop').slice(0, 30);
+    await vm.addBackdrop(`${asset.assetId}.svg`, {
+        name,
+        dataFormat: 'svg',
+        asset,
+        md5: `${asset.assetId}.svg`,
+        assetId: asset.assetId,
+        rotationCenterX: cx,
+        rotationCenterY: cy
+    });
+    return {added: name};
+};
+
+/* ------------------------------------------------------------ stage eye */
+
+const seeStage = () => new Promise((resolve, reject) => {
+    const renderer = refs.vm.renderer;
+    if (!renderer || typeof renderer.requestSnapshot !== 'function') {
+        reject(new Error('stage snapshots not supported here'));
+        return;
+    }
+    renderer.requestSnapshot(dataURI => resolve({image: dataURI}));
+});
+
 /* ------------------------------------------------------------ dispatch */
 
 const ACTIONS = {
@@ -287,14 +410,13 @@ const ACTIONS = {
     add_script: msg => addScript(msg.xml),
     delete_script: msg => {
         const block = refs.workspace.getBlockById(msg.blockId);
-        if (!block) throw new Error(`No block ${msg.blockId}`);
+        if (!block) throw new Error(`No block ${msg.blockId} on the selected sprite — select_sprite first?`);
         block.dispose(true);
         return {deleted: msg.blockId};
     },
     set_field: msg => {
         const block = refs.workspace.getBlockById(msg.blockId);
-        if (!block) throw new Error(`No block ${msg.blockId}`);
-        // The field usually lives on a shadow input of the named block.
+        if (!block) throw new Error(`No block ${msg.blockId} on the selected sprite — select_sprite first?`);
         let done = false;
         const trySet = candidate => {
             if (done || !candidate) return;
@@ -314,6 +436,9 @@ const ACTIONS = {
     read_workspace: () => readWorkspace(),
     select_sprite: msg => selectSprite(msg.name),
     add_sprite: msg => addSprite(msg.name),
+    add_custom_sprite: msg => addCustomSprite(msg),
+    add_custom_backdrop: msg => addCustomBackdrop(msg),
+    see_stage: () => seeStage(),
     run_project: () => {
         refs.vm.greenFlag();
         return {running: true};
