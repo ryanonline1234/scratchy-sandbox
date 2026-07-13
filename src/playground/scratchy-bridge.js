@@ -17,6 +17,8 @@
  * Plus one unsolicited event on boot: {scratchy: true, event: 'ready'}
  */
 
+import storage from '../lib/storage';
+
 const ALLOWED_PARENTS = [
     'http://localhost:3000',
     'http://localhost:8601',
@@ -25,6 +27,7 @@ const ALLOWED_PARENTS = [
 ];
 
 const REVEAL_MS = 550; // per-block reveal pace (kid-watchable)
+const ACTION_TIMEOUT_MS = 30000; // watchdog: a stuck action must never jam the bridge
 
 let refs = null; // {workspace, ScratchBlocks, vm}
 let busy = false;
@@ -171,17 +174,18 @@ const addScript = async xmlText => {
     workspace.getTopBlocks(false).forEach(b => {
         beforeIds[b.id] = true;
     });
+    // Compute the landing spot BEFORE inserting, from existing scripts only.
+    const freeY = nextFreeY(workspace);
     ScratchBlocks.Events.setGroup(true);
     let newTops;
     try {
         ScratchBlocks.Xml.domToWorkspace(dom, workspace);
         newTops = workspace.getTopBlocks(false).filter(b => !beforeIds[b.id]);
-        // Place below existing scripts unless the XML pinned a position.
-        newTops.forEach(top => {
+        // Always place below existing scripts — domToWorkspace's default
+        // spot overlaps whatever is already there.
+        newTops.forEach((top, i) => {
             const xy = top.getRelativeToSurfaceXY();
-            if (xy.x === 0 && xy.y === 0) {
-                top.moveBy(60, nextFreeY(workspace) - xy.y);
-            }
+            top.moveBy(60 - xy.x, (freeY + i * 60) - xy.y);
         });
     } finally {
         ScratchBlocks.Events.setGroup(false);
@@ -338,12 +342,21 @@ const onMessage = async event => {
     try {
         const handler = ACTIONS[msg.action];
         if (!handler) throw new Error(`Unknown action ${msg.action}`);
-        const data = await handler(msg);
+        // Watchdog: a hung action (e.g. an asset download that never
+        // settles) must not jam the bridge forever.
+        const data = await Promise.race([
+            Promise.resolve(handler(msg)),
+            new Promise((_, rejectRace) => setTimeout(
+                () => rejectRace(new Error(`${msg.action} took too long (30s) — the sandbox gave up on it`)),
+                ACTION_TIMEOUT_MS
+            ))
+        ]);
         reply({ok: true, data});
     } catch (err) {
         reply({ok: false, error: (err && err.message) || String(err)});
     } finally {
         busy = false;
+        showCursor(false);
     }
 };
 
@@ -352,6 +365,30 @@ const onMessage = async event => {
  */
 export default function initScratchyBridge (newRefs) {
     refs = newRefs;
+    // The playground never configures storage hosts, so library sprites,
+    // backdrops, and sounds cannot download their assets (vm.addSprite
+    // hangs). Point storage at Scratch's public CDN, like scratch-www does.
+    if (!storage.assetHost) {
+        storage.setAssetHost('https://assets.scratch.mit.edu');
+    }
+    if (!storage.projectHost) {
+        storage.setProjectHost('https://projects.scratch.mit.edu');
+    }
+    // The playground's fetch-worker never completes its jobs in this build,
+    // and storage's ProxyTool awaits the first tool with no fallback — so
+    // every library-asset download hangs forever. Drop the worker tool and
+    // let the plain in-page FetchTool (which works) handle assets.
+    // Identified structurally ('inner'/'worker' props) because class names
+    // are minified in production.
+    try {
+        const assetTool = storage.webHelper && storage.webHelper.assetTool;
+        if (assetTool && Array.isArray(assetTool.tools)) {
+            const plain = assetTool.tools.filter(t => t && !('inner' in t) && !('worker' in t));
+            if (plain.length > 0 && plain.length < assetTool.tools.length) {
+                assetTool.tools = plain;
+            }
+        }
+    } catch (e) { /* non-fatal — worst case the sprite library stays broken */ }
     if (!window.__scratchyBridgeListening) {
         window.__scratchyBridgeListening = true;
         window.addEventListener('message', onMessage);
