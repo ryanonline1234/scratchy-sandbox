@@ -283,15 +283,88 @@ const readWorkspace = () => {
 
 /* ------------------------------------------------------------ sprites */
 
-const selectSprite = async name => {
+const findTarget = (name, {allowStage = true} = {}) => {
     const {vm} = refs;
     const target = vm.runtime.targets.find(
         t => t.isOriginal && t.getName().toLowerCase() === String(name).toLowerCase()
     );
     if (!target) throw new Error(`No sprite named "${name}"`);
+    if (!allowStage && target.isStage) throw new Error('That is the Stage, not a sprite');
+    return target;
+};
+
+const selectSprite = async name => {
+    const {vm} = refs;
+    const target = findTarget(name);
     vm.setEditingTarget(target.id);
     await sleep(300); // let the Blockly workspace swap before the next action
     return {selected: target.getName()};
+};
+
+const deleteSprite = name => {
+    const {vm} = refs;
+    const target = findTarget(name, {allowStage: false});
+    const deletedName = target.getName();
+    vm.deleteSprite(target.id);
+    return {deleted: deletedName};
+};
+
+const renameSprite = (name, to) => {
+    const {vm} = refs;
+    const target = findTarget(name, {allowStage: false});
+    vm.renameSprite(target.id, String(to));
+    return {renamed: target.getName()};
+};
+
+const duplicateSprite = async (name, as) => {
+    const {vm} = refs;
+    const target = findTarget(name, {allowStage: false});
+    const before = {};
+    vm.runtime.targets.forEach(t => {
+        before[t.id] = true;
+    });
+    await vm.duplicateSprite(target.id);
+    const fresh = vm.runtime.targets.find(t => !before[t.id] && t.isOriginal);
+    if (as && fresh) vm.renameSprite(fresh.id, String(as));
+    return {duplicated: target.getName(), as: fresh ? fresh.getName() : null};
+};
+
+const setSprite = msg => {
+    const target = findTarget(msg.name, {allowStage: false});
+    if (typeof msg.x === 'number' || typeof msg.y === 'number') {
+        target.setXY(
+            typeof msg.x === 'number' ? msg.x : target.x,
+            typeof msg.y === 'number' ? msg.y : target.y
+        );
+    }
+    if (typeof msg.size === 'number') target.setSize(msg.size);
+    if (typeof msg.direction === 'number') target.setDirection(msg.direction);
+    if (typeof msg.visible === 'boolean') target.setVisible(msg.visible);
+    if (msg.layer === 'front') target.goToFront();
+    if (msg.layer === 'back') target.goToBack();
+    return {
+        set: target.getName(),
+        x: Math.round(target.x),
+        y: Math.round(target.y),
+        size: target.size,
+        direction: target.direction,
+        visible: target.visible
+    };
+};
+
+const deleteCostume = async (spriteName, costumeName) => {
+    const {vm} = refs;
+    const target = findTarget(spriteName);
+    const costumes = target.getCostumes();
+    if (costumes.length <= 1) throw new Error('A sprite needs at least one costume — redraw it instead');
+    const index = costumes.findIndex(c => c.name.toLowerCase() === String(costumeName).toLowerCase());
+    if (index === -1) {
+        throw new Error(`No costume "${costumeName}" on ${target.getName()} (has: ${costumes.map(c => c.name).join(', ')})`);
+    }
+    vm.setEditingTarget(target.id);
+    await sleep(150);
+    vm.deleteCostume(index);
+    return {deleted: costumeName, remaining: target.getCostumes().map(c => c.name)};
 };
 
 const addSprite = async name => {
@@ -347,6 +420,33 @@ const addCustomSprite = async msg => {
     const {vm} = refs;
     const {asset, cx, cy} = svgToAsset(msg.svg);
     const name = String(msg.name || 'My Sprite').slice(0, 30);
+    // Redraw semantics: drawing a name that already exists REPLACES that
+    // sprite's look (new costume, switched to) instead of spawning
+    // "Dragon2" — the #1 mess reported from real use.
+    const existing = vm.runtime.targets.find(
+        t => t.isOriginal && !t.isStage && t.getName().toLowerCase() === name.toLowerCase()
+    );
+    if (existing) {
+        const md5ext = `${asset.assetId}.svg`;
+        await vm.addCostume(md5ext, {
+            name: `look ${existing.getCostumes().length + 1}`,
+            dataFormat: 'svg',
+            asset,
+            md5: md5ext,
+            assetId: asset.assetId,
+            rotationCenterX: cx,
+            rotationCenterY: cy
+        }, existing.id);
+        existing.setCostume(existing.getCostumes().length - 1);
+        if (typeof msg.x === 'number' || typeof msg.y === 'number') {
+            existing.setXY(
+                typeof msg.x === 'number' ? msg.x : existing.x,
+                typeof msg.y === 'number' ? msg.y : existing.y
+            );
+        }
+        if (typeof msg.size === 'number') existing.setSize(msg.size);
+        return {added: existing.getName(), replacedLook: true, costumes: existing.getCostumes().map(c => c.name)};
+    }
     const sprite = {
         name,
         isStage: false,
@@ -451,6 +551,11 @@ const ACTIONS = {
     add_sprite: msg => addSprite(msg.name),
     add_custom_sprite: msg => addCustomSprite(msg),
     add_custom_backdrop: msg => addCustomBackdrop(msg),
+    delete_sprite: msg => deleteSprite(msg.name),
+    rename_sprite: msg => renameSprite(msg.name, msg.to),
+    duplicate_sprite: msg => duplicateSprite(msg.name, msg.as),
+    set_sprite: msg => setSprite(msg),
+    delete_costume: msg => deleteCostume(msg.sprite, msg.costume),
     see_stage: () => seeStage(),
     run_project: () => {
         refs.vm.greenFlag();
@@ -527,6 +632,13 @@ export default function initScratchyBridge (newRefs) {
             }
         }
     } catch (e) { /* non-fatal — worst case the sprite library stays broken */ }
+    // Pen blocks are an extension — load it so Scratchy (and kids, via the
+    // toolbox) can use stamp/pen-down drawing.
+    try {
+        if (!newRefs.vm.extensionManager.isExtensionLoaded('pen')) {
+            newRefs.vm.extensionManager.loadExtensionIdSync('pen');
+        }
+    } catch (e) { /* non-fatal — pen category just won't appear */ }
     if (!window.__scratchyBridgeListening) {
         window.__scratchyBridgeListening = true;
         window.addEventListener('message', onMessage);
