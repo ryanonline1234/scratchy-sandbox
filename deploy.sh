@@ -23,10 +23,13 @@ done
 # scratch-storage ships prebuilt with a nested webpack runtime that loads
 # chunks/fetch-worker.<hash>.js at runtime — scratch-gui's build never
 # copies it, so the worker 404s (this was the root cause of the original
-# library-asset hang). Ship the real file AND its source map (the worker
-# carries a sourceMappingURL pointer; without the map, devtools log a 404).
+# library-asset hang). Ship the real file, minus its sourceMappingURL
+# pointer (Vercel 403s .map files on production, so shipping maps is moot).
 cp ../node_modules/scratch-storage/dist/web/chunks/fetch-worker.*.js chunks/ 2>/dev/null || true
-cp ../node_modules/scratch-storage/dist/web/chunks/fetch-worker.*.js.map chunks/ 2>/dev/null || true
+for f in chunks/fetch-worker.*.js; do
+  [ -f "$f" ] && sed -i '' -e 's|^//# sourceMappingURL=.*$||' "$f"
+done
+rm -f chunks/fetch-worker.*.js.map
 
 vercel link --yes --project scratchy-sandbox
 vercel deploy --prod --yes
