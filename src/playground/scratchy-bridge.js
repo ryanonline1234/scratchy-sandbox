@@ -17,6 +17,8 @@
  *   {scratchy: true, id, action: 'add_custom_backdrop', svg, name?}
  *   {scratchy: true, id, action: 'see_stage'}                   // -> {image: dataURI}
  *   {scratchy: true, id, action: 'run_project'} | 'stop_project'
+ *   {scratchy: true, id, action: 'export_project'}              // -> {sb3: base64, size}
+ *   {scratchy: true, id, action: 'load_project', sb3?|json?}    // replaces the whole project
  * Replies (sandbox -> parent): {scratchy: true, id, ok, data?, error?}
  * Plus one unsolicited event on boot: {scratchy: true, event: 'ready'}
  */
@@ -564,7 +566,46 @@ const ACTIONS = {
     stop_project: () => {
         refs.vm.stopAll();
         return {running: false};
+    },
+    export_project: async () => {
+        const blob = await refs.vm.saveProjectSb3();
+        if (blob.size > 20 * 1024 * 1024) {
+            throw new Error('Project is over 20MB — too big to export here');
+        }
+        return {sb3: await blobToBase64(blob), size: blob.size};
+    },
+    load_project: async msg => {
+        if (msg.sb3) {
+            await refs.vm.loadProject(base64ToBuffer(msg.sb3));
+        } else if (msg.json) {
+            await refs.vm.loadProject(
+                typeof msg.json === 'string' ? msg.json : JSON.stringify(msg.json)
+            );
+        } else {
+            throw new Error('load_project needs sb3 (base64) or json');
+        }
+        return {
+            loaded: true,
+            sprites: refs.vm.runtime.targets.filter(t => t.isOriginal && !t.isStage).length
+        };
     }
+};
+
+// postMessage carries strings, so project bytes travel as base64.
+const blobToBase64 = async blob => {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let bin = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(bin);
+};
+const base64ToBuffer = b64 => {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes.buffer;
 };
 
 const onMessage = async event => {
